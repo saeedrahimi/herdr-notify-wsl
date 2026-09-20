@@ -57,14 +57,19 @@ prev="{}"
 [[ -f "$STATE_PATH" ]] && prev=$(cat "$STATE_PATH" 2>/dev/null || echo '{}')
 
 # Notifications: only a working -> rest edge fires. Emits TSV: agent<TAB>workspace<TAB>kind
+#
+# The parentheses around `if ... end` are load-bearing, not cosmetic: `as` binds a term, and an
+# `if ... end` expression is not one, so `if ... end as $kind` is a syntax error on jq 1.6 that
+# aborts the whole hook before it can ever persist state. jaq accepts both forms, which is how the
+# bare form can survive in a shell whose `jq` is really jaq.
 notifs=$(jq -rn --argjson prev "$prev" --argjson cur "$current" '
   $cur | to_entries[]
   | . as $e
   | ($prev[$e.key] // "") as $before
   | select($before == "working")
-  | if (["done","idle"] | index($e.value.status)) then "done"
-    elif $e.value.status == "blocked" then "blocked"
-    else empty end as $kind
+  | (if (["done","idle"] | index($e.value.status)) then "done"
+     elif $e.value.status == "blocked" then "blocked"
+     else empty end) as $kind
   | [$e.value.agent, $e.value.workspace, $kind] | @tsv')
 
 # Resolve a workspace id to a human label, falling back to the id.
