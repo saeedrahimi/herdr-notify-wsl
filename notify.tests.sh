@@ -25,12 +25,32 @@ run_state() {
 }
 count() { if [[ -f "$MOCK_TOAST_LOG" ]]; then wc -l < "$MOCK_TOAST_LOG"; else echo 0; fi; }
 assert_count() { [[ $(count) -eq "$1" ]] || { echo "Expected $1 notifications, got $(count)" >&2; exit 1; }; }
+export HERDR_SOCKET_PATH="$tmp/session-a/herdr.sock"
+state_file() { find "$tmp/state" -name 'agent-status-*.json' -type f | head -1; }
+age_working() {
+  local f="$1" output
+  output=$(mktemp)
+  jq 'with_entries(if .value.status == "working" then .value.started -= 35 else . end)' "$f" > "$output"
+  mv "$output" "$f"
+}
 run_state working; assert_count 0
+run_state done; assert_count 0 # short completion suppressed
+run_state working; assert_count 0
+age_working "$(state_file)"
 run_state done; assert_count 1
 run_state done; assert_count 1
 run_state working; assert_count 1
-run_state blocked; assert_count 2
+run_state blocked; assert_count 2 # blocked immediately
 run_state blocked; assert_count 2
 run_state working; assert_count 2
+age_working "$(state_file)"
 run_state idle; assert_count 3
-printf 'PASS: completed, blocked, idle, and duplicate suppression\n'
+# Same pane ID on another Herdr server must have an independent state file.
+export HERDR_SOCKET_PATH="$tmp/session-b/herdr.sock"
+run_state done; assert_count 3
+run_state working; assert_count 3
+key=$(printf '%s' "$HERDR_SOCKET_PATH" | sha256sum | cut -c 1-16)
+age_working "$tmp/state/agent-status-$key.json"
+run_state done; assert_count 4
+[[ $(find "$tmp/state" -name 'agent-status-*.json' -type f | wc -l) -eq 2 ]]
+printf 'PASS: 30s threshold, done/blocked/idle, de-duplication, session isolation\n'

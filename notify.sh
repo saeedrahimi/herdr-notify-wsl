@@ -17,7 +17,14 @@ set -euo pipefail
 
 HERDR_BIN="${HERDR_BIN_PATH:-herdr}"
 STATE_DIR="${HERDR_PLUGIN_STATE_DIR:-${TMPDIR:-/tmp}}"
-STATE_PATH="$STATE_DIR/agent-status.json"
+# Plugin state directory is shared across named Herdr sessions. Scope by the
+# session socket because pane IDs (e.g. w1:p1) repeat across sessions.
+SESSION_KEY="${HERDR_SOCKET_PATH:-${HERDR_SESSION:-default}}"
+SESSION_HASH=$(printf '%s' "$SESSION_KEY" | sha256sum | cut -c 1-16)
+STATE_PATH="$STATE_DIR/agent-status-$SESSION_HASH.json"
+LOCK_PATH="$STATE_PATH.lock"
+MIN_DONE_SECONDS="${HERDR_NOTIFY_MIN_SECONDS:-30}"
+
 PS="${WINDIR:+$WINDIR/System32/WindowsPowerShell/v1.0/powershell.exe}"
 PS="${PS:-powershell.exe}"
 
@@ -46,26 +53,40 @@ if [[ "${1:-}" == "--test" || "${1:-}" == "-Test" ]]; then
   exit 0
 fi
 
-# Current agent panes -> JSON object { pane_id: {status, agent, workspace} }
+# Serialize read/compare/write to prevent concurrent event handlers from
+# racing and sending duplicate notifications.
+mkdir -p "$STATE_DIR"
+exec 9>"$LOCK_PATH"
+flock 9
+
 current=$("$HERDR_BIN" pane list 2>/dev/null | jq -c '
   [.result.panes[] | select(.agent != null and .agent != "")
     | {key: .pane_id, value: {status: (.agent_status // ""), agent: (.agent // ""), workspace: (.workspace_id // "")}}]
   | from_entries')
+prev='{}'
+[[ ! -f "$STATE_PATH" ]] || prev=$(cat "$STATE_PATH")
+now=$(date +%s)
 
-# Previous status map { pane_id: status }; empty object if no state yet.
-prev="{}"
-[[ -f "$STATE_PATH" ]] && prev=$(cat "$STATE_PATH" 2>/dev/null || echo '{}')
-
-# Notifications: only a working -> rest edge fires. Emits TSV: agent<TAB>workspace<TAB>kind
-notifs=$(jq -rn --argjson prev "$prev" --argjson cur "$current" '
-  $cur | to_entries[]
-  | . as $e
-  | ($prev[$e.key] // "") as $before
-  | select($before == "working")
-  | (if (["done","idle"] | index($e.value.status)) then "done"
-    elif $e.value.status == "blocked" then "blocked"
-    else empty end) as $kind
+# Notify immediately when blocked. For completed turns, suppress short turns.
+# Preserve the first working timestamp while a turn remains active.
+notifs=$(jq -rn --argjson prev "$prev" --argjson cur "$current" --argjson now "$now" --argjson threshold "$MIN_DONE_SECONDS" '
+  $cur | to_entries[] | . as $e
+  | ($prev[$e.key] // {}) as $before
+  | select($before.status == "working")
+  | (if $e.value.status == "blocked" then "blocked"
+     elif (["done","idle"] | index($e.value.status)) and ($now - ($before.started // $now) >= $threshold) then "done"
+     else empty end) as $kind
   | [$e.value.agent, $e.value.workspace, $kind] | @tsv')
+
+next=$(jq -n --argjson prev "$prev" --argjson cur "$current" --argjson now "$now" '
+  $cur | with_entries(.key as $id | .value |=
+    {status: .status, started: (if .status == "working" then
+      (if $prev[$id].status == "working" then ($prev[$id].started // $now) else $now end)
+      else null end)})')
+tmp=$(mktemp "$STATE_PATH.tmp.XXXXXX")
+printf '%s\n' "$next" > "$tmp"
+mv -f "$tmp" "$STATE_PATH"
+flock -u 9
 
 # Resolve a workspace id to a human label, falling back to the id.
 workspace_label() {
@@ -89,6 +110,4 @@ if [[ -n "$notifs" ]]; then
   done <<< "$notifs"
 fi
 
-# Persist current statuses as { pane_id: status } for the next diff.
-mkdir -p "$STATE_DIR"
-echo "$current" | jq -c 'map_values(.status)' > "$STATE_PATH"
+# State is persisted atomically before toast delivery.
