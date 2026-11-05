@@ -62,9 +62,9 @@ notifs=$(jq -rn --argjson prev "$prev" --argjson cur "$current" '
   | . as $e
   | ($prev[$e.key] // "") as $before
   | select($before == "working")
-  | if (["done","idle"] | index($e.value.status)) then "done"
+  | (if (["done","idle"] | index($e.value.status)) then "done"
     elif $e.value.status == "blocked" then "blocked"
-    else empty end as $kind
+    else empty end) as $kind
   | [$e.value.agent, $e.value.workspace, $kind] | @tsv')
 
 # Resolve a workspace id to a human label, falling back to the id.
